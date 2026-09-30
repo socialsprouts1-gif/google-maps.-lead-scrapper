@@ -68,6 +68,36 @@
       color: #007BFF;
       text-decoration: none;
     }
+    .filters {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      align-items: center;
+      margin-top: 15px;
+      font-size: 13px;
+    }
+    .input.small {
+      width: 60px;
+      margin: 0 0 0 5px;
+    }
+    #status {
+      margin-top: 10px;
+      font-size: 13px;
+      color: #555;
+    }
+    .table-wrap {
+      overflow-x: auto;
+    }
+    td {
+      font-size: 12px;
+      white-space: nowrap;
+      max-width: 220px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    th {
+      white-space: nowrap;
+    }
   </style>  
 </head>
 <body>
@@ -80,6 +110,15 @@
   <button id="actionButton" class="button" disabled>Scrape Google Maps</button>
   <button id="downloadCsvButton" class="button" style="margin-left: 10px;" disabled>Download as CSV</button>
   <input type="text" id="filenameInput" class="input" placeholder="Enter file name" style="margin-left: 10px;" />
+  <button id="findEmailsButton" class="button" style="margin-top: 10px;" disabled>Find Emails &amp; Socials</button>
+  <div class="filters">
+    <label>Min rating <input type="number" id="minRating" class="input small" min="0" max="5" step="0.1" placeholder="0"></label>
+    <label>Min reviews <input type="number" id="minReviews" class="input small" min="0" step="1" placeholder="0"></label>
+    <label><input type="checkbox" id="hasPhone"> Has phone</label>
+    <label><input type="checkbox" id="noWebsite"> No website</label>
+  </div>
+  <div id="status"></div>
+  <div class="table-wrap">
   <table id="resultsTable">
     <thead>
       <tr>
@@ -88,6 +127,7 @@
     <tbody>
     </tbody>
   </table>
+  </div>
   <script src="popup.js"></script>
 </body>
 </html>

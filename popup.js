@@ -1,10 +1,31 @@
+var COLUMNS = [
+    { key: 'title', label: 'Title' },
+    { key: 'rating', label: 'Rating' },
+    { key: 'reviewCount', label: 'Reviews' },
+    { key: 'phone', label: 'Phone' },
+    { key: 'industry', label: 'Industry' },
+    { key: 'address', label: 'Address' },
+    { key: 'companyUrl', label: 'Website' },
+    { key: 'email', label: 'Email' },
+    { key: 'instagram', label: 'Instagram' },
+    { key: 'facebook', label: 'Facebook' },
+    { key: 'linkedin', label: 'LinkedIn' },
+    { key: 'href', label: 'Google Maps Link' }
+];
+
+var allResults = [];
+
 document.addEventListener('DOMContentLoaded', function() {
     chrome.tabs.query({active: true, currentWindow: true}, function(tabs) {
         var currentTab = tabs[0];
         var actionButton = document.getElementById('actionButton');
         var downloadCsvButton = document.getElementById('downloadCsvButton');
+        var findEmailsButton = document.getElementById('findEmailsButton');
         var resultsTable = document.getElementById('resultsTable');
         var filenameInput = document.getElementById('filenameInput');
+        var filterInputs = ['minRating', 'minReviews', 'hasPhone', 'noWebsite'].map(function(id) {
+            return document.getElementById(id);
+        });
 
         if (currentTab && currentTab.url.includes("://www.google.com/maps/search")) {
             document.getElementById('message').textContent = "Let's scrape Google Maps!";
@@ -20,49 +41,49 @@ document.addEventListener('DOMContentLoaded', function() {
             messageElement.appendChild(linkElement);
 
             actionButton.style.display = 'none'; 
-            downloadCsvButton.style.display = 'none';
-            filenameInput.style.display = 'none'; 
         }
+
+        // Restore the last results, so closing the popup doesn't lose them
+        chrome.storage.local.get('results', function(data) {
+            if (data && Array.isArray(data.results) && data.results.length) {
+                allResults = data.results;
+                refresh();
+            }
+        });
+
+        filterInputs.forEach(function(input) {
+            input.addEventListener('input', refresh);
+            input.addEventListener('change', refresh);
+        });
 
         actionButton.addEventListener('click', function() {
             chrome.scripting.executeScript({
                 target: {tabId: currentTab.id},
                 function: scrapeData
             }, function(results) {
-                while (resultsTable.firstChild) {
-                    resultsTable.removeChild(resultsTable.firstChild);
-                }
-
-                // Define and add headers to the table
-                const headers = ['Title', 'Rating', 'Reviews', 'Phone', 'Industry', 'Address', 'Website', 'Google Maps Link'];
-                const headerRow = document.createElement('tr');
-                headers.forEach(headerText => {
-                    const header = document.createElement('th');
-                    header.textContent = headerText;
-                    headerRow.appendChild(header);
-                });
-                resultsTable.appendChild(headerRow);
-
-                // Add new results to the table
                 if (!results || !results[0] || !results[0].result) return;
-                results[0].result.forEach(function(item) {
-                    var row = document.createElement('tr');
-                    ['title', 'rating', 'reviewCount', 'phone', 'industry', 'address', 'companyUrl', 'href'].forEach(function(key) {
-                        var cell = document.createElement('td');
-                        
-                        if (key === 'reviewCount' && item[key]) {
-                            item[key] = item[key].replace(/\(|\)/g, ''); 
-                        }
-                        
-                        cell.textContent = item[key] || ''; 
-                        row.appendChild(cell);
-                    });
-                    resultsTable.appendChild(row);
+                allResults = results[0].result.map(function(item) {
+                    item.reviewCount = (item.reviewCount || '').replace(/\(|\)/g, '');
+                    item.companyUrl = cleanWebsite(item.companyUrl);
+                    item.email = '';
+                    item.instagram = '';
+                    item.facebook = '';
+                    item.linkedin = '';
+                    return item;
                 });
+                saveResults();
+                refresh();
+            });
+        });
 
-                if (results && results[0] && results[0].result && results[0].result.length > 0) {
-                    downloadCsvButton.disabled = false;
+        findEmailsButton.addEventListener('click', function() {
+            // Ask for access to websites only when this feature is used
+            chrome.permissions.request({ origins: ['http://*/*', 'https://*/*'] }, function(granted) {
+                if (!granted) {
+                    setStatus('Website access is needed to find emails and social links.');
+                    return;
                 }
+                findEmailsAndSocials();
             });
         });
 
@@ -77,8 +98,221 @@ document.addEventListener('DOMContentLoaded', function() {
             downloadCsv(csv, filename); 
         });
 
+        function refresh() {
+            var shown = renderTable(resultsTable, filterResults(allResults));
+            downloadCsvButton.disabled = shown === 0;
+            findEmailsButton.disabled = !allResults.some(function(item) { return item.companyUrl; });
+            if (allResults.length) {
+                setStatus('Showing ' + shown + ' of ' + allResults.length + ' businesses. Download exports only the rows shown.');
+            }
+        }
+
+        function findEmailsAndSocials() {
+            var todo = allResults.filter(function(item) { return item.companyUrl && !item.checked; });
+            var done = 0;
+            var next = 0;
+            findEmailsButton.disabled = true;
+            actionButton.disabled = true;
+            setStatus('Checking websites: 0 of ' + todo.length + '... keep this popup open.');
+
+            function worker() {
+                if (next >= todo.length) return Promise.resolve();
+                var item = todo[next++];
+                return getContactInfo(item.companyUrl).then(function(info) {
+                    item.email = info.emails.join('; ');
+                    item.instagram = info.instagram;
+                    item.facebook = info.facebook;
+                    item.linkedin = info.linkedin;
+                    item.checked = true;
+                }).catch(function() {
+                    item.checked = true;
+                }).then(function() {
+                    done++;
+                    saveResults();
+                    refresh();
+                    setStatus('Checking websites: ' + done + ' of ' + todo.length + '... keep this popup open.');
+                    return worker();
+                });
+            }
+
+            // Check 4 websites at a time
+            var workers = [];
+            for (var i = 0; i < 4; i++) workers.push(worker());
+            Promise.all(workers).then(function() {
+                actionButton.disabled = false;
+                refresh();
+                var found = allResults.filter(function(item) { return item.email; }).length;
+                setStatus('Done. Found emails for ' + found + ' of ' + allResults.length + ' businesses.');
+            });
+        }
     });
 });
+
+function setStatus(text) {
+    document.getElementById('status').textContent = text;
+}
+
+function saveResults() {
+    chrome.storage.local.set({ results: allResults });
+}
+
+function filterResults(results) {
+    var minRating = parseFloat(document.getElementById('minRating').value) || 0;
+    var minReviews = parseInt(document.getElementById('minReviews').value, 10) || 0;
+    var hasPhone = document.getElementById('hasPhone').checked;
+    var noWebsite = document.getElementById('noWebsite').checked;
+
+    return results.filter(function(item) {
+        var rating = parseFloat(item.rating) || 0;
+        var reviews = parseInt((item.reviewCount || '').replace(/\D/g, ''), 10) || 0;
+        if (rating < minRating) return false;
+        if (reviews < minReviews) return false;
+        if (hasPhone && !item.phone) return false;
+        if (noWebsite && item.companyUrl) return false;
+        return true;
+    });
+}
+
+function renderTable(table, results) {
+    while (table.firstChild) {
+        table.removeChild(table.firstChild);
+    }
+
+    var headerRow = document.createElement('tr');
+    COLUMNS.forEach(function(column) {
+        var header = document.createElement('th');
+        header.textContent = column.label;
+        headerRow.appendChild(header);
+    });
+    table.appendChild(headerRow);
+
+    results.forEach(function(item) {
+        var row = document.createElement('tr');
+        COLUMNS.forEach(function(column) {
+            var cell = document.createElement('td');
+            cell.textContent = item[column.key] || '';
+            cell.title = cell.textContent;
+            row.appendChild(cell);
+        });
+        table.appendChild(row);
+    });
+    return results.length;
+}
+
+// Google sometimes wraps websites as google.com/url?q=...; unwrap those and
+// drop links that point back to Google itself (not a real website)
+function cleanWebsite(url) {
+    if (!url) return '';
+    try {
+        var parsed = new URL(url);
+        if (/(^|\.)google\./.test(parsed.hostname)) {
+            var target = parsed.searchParams.get('q') || parsed.searchParams.get('url');
+            return target && /^https?:\/\//.test(target) ? cleanWebsite(target) : '';
+        }
+        return url;
+    } catch (e) {
+        return '';
+    }
+}
+
+// Fetch a page with a time limit and parse it as HTML
+function fetchPage(url) {
+    var controller = new AbortController();
+    var timer = setTimeout(function() { controller.abort(); }, 10000);
+    return fetch(url, { signal: controller.signal, credentials: 'omit' }).then(function(response) {
+        clearTimeout(timer);
+        var type = response.headers.get('content-type') || '';
+        if (!response.ok || type.indexOf('html') === -1) throw new Error('Not an HTML page');
+        return response.text().then(function(html) {
+            return { url: response.url || url, doc: new DOMParser().parseFromString(html, 'text/html'), html: html };
+        });
+    }, function(error) {
+        clearTimeout(timer);
+        throw error;
+    });
+}
+
+// Visit the website's home page (and its contact/about page if needed) and
+// collect email addresses and Instagram, Facebook and LinkedIn links
+function getContactInfo(website) {
+    var info = { emails: [], instagram: '', facebook: '', linkedin: '' };
+    var visited = {};
+
+    function scan(page) {
+        visited[page.url.replace(/#.*$/, '')] = true;
+        extractEmails(page).forEach(function(email) {
+            if (info.emails.indexOf(email) === -1) info.emails.push(email);
+        });
+        Array.from(page.doc.querySelectorAll('a[href]')).forEach(function(a) {
+            var href = a.getAttribute('href') || '';
+            if (!info.instagram && /^https?:\/\/(www\.)?instagram\.com\/(?!p\/|reel\/|explore\/|share)[\w.]+/i.test(href)) info.instagram = href;
+            if (!info.facebook && /^https?:\/\/(www\.|m\.|web\.)?(facebook|fb)\.com\/(?!sharer|share|dialog|plugins|tr\b)[^\s]+/i.test(href)) info.facebook = href;
+            if (!info.linkedin && /^https?:\/\/([a-z]{2,3}\.)?linkedin\.com\/(company|in|school)\/[^\s]+/i.test(href)) info.linkedin = href;
+        });
+    }
+
+    return fetchPage(website).then(function(home) {
+        scan(home);
+        if (info.emails.length) return info;
+
+        // No email on the home page: try up to 2 contact/about pages on the same site
+        var host = new URL(home.url).hostname;
+        var candidates = [];
+        Array.from(home.doc.querySelectorAll('a[href]')).forEach(function(a) {
+            var text = (a.textContent + ' ' + a.getAttribute('href')).toLowerCase();
+            if (!/contact|about|reach|get-in-touch/.test(text)) return;
+            try {
+                var url = new URL(a.getAttribute('href'), home.url);
+                url.hash = '';
+                if (url.hostname === host && !visited[url.href] && candidates.indexOf(url.href) === -1) {
+                    candidates.push(url.href);
+                }
+            } catch (e) {}
+        });
+
+        return candidates.slice(0, 2).reduce(function(chain, url) {
+            return chain.then(function() {
+                if (info.emails.length) return;
+                return fetchPage(url).then(scan, function() {});
+            });
+        }, Promise.resolve()).then(function() { return info; });
+    });
+}
+
+function extractEmails(page) {
+    var found = [];
+
+    // mailto: links
+    Array.from(page.doc.querySelectorAll('a[href^="mailto:" i]')).forEach(function(a) {
+        found.push(decodeURIComponent(a.getAttribute('href').slice(7).split('?')[0]));
+    });
+
+    // Cloudflare-protected emails
+    Array.from(page.doc.querySelectorAll('[data-cfemail]')).forEach(function(el) {
+        var encoded = el.getAttribute('data-cfemail');
+        var key = parseInt(encoded.substr(0, 2), 16);
+        var email = '';
+        for (var i = 2; i < encoded.length; i += 2) {
+            email += String.fromCharCode(parseInt(encoded.substr(i, 2), 16) ^ key);
+        }
+        found.push(email);
+    });
+
+    // Emails written in the page text or HTML
+    var text = (page.doc.body ? page.doc.body.textContent : '') + ' ' + page.html;
+    found = found.concat(text.match(/[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/gi) || []);
+
+    var unique = [];
+    found.forEach(function(email) {
+        email = email.trim().toLowerCase().replace(/^[^a-z0-9]+|[^a-z]+$/g, '');
+        if (!/^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$/.test(email)) return;
+        if (/\.(png|jpe?g|gif|svg|webp|css|js)$/.test(email)) return;
+        if (/(example\.|sentry|wixpress|domain\.com|email\.com|yourdomain|@2x)/.test(email)) return;
+        if (unique.indexOf(email) === -1) unique.push(email);
+    });
+    return unique.slice(0, 3);
+}
+
 
 
 function scrapeData() {
@@ -222,6 +456,7 @@ function scrapeData() {
 function tableToCsv(table) {
     var csv = [];
     var rows = table.querySelectorAll('tr');
+    var phoneColumn = COLUMNS.map(function(column) { return column.key; }).indexOf('phone');
     
     for (var i = 0; i < rows.length; i++) {
         var row = [], cols = rows[i].querySelectorAll('td, th');
@@ -229,7 +464,7 @@ function tableToCsv(table) {
         for (var j = 0; j < cols.length; j++) {
             var value = (cols[j].textContent || '').trim();
             // Write phone numbers as text so Excel/Sheets keep the leading zero
-            if (cols[j].tagName === 'TD' && j === 3 && value) {
+            if (cols[j].tagName === 'TD' && j === phoneColumn && value) {
                 value = '="' + value + '"';
             }
             row.push('"' + value.replace(/"/g, '""') + '"');
@@ -238,7 +473,6 @@ function tableToCsv(table) {
     }
     return csv.join('\r\n');
 }
-
 // Download the CSV file
 function downloadCsv(csv, filename) {
     var csvFile;
