@@ -27,7 +27,7 @@ document.addEventListener('DOMContentLoaded', function() {
             return document.getElementById(id);
         });
 
-        if (currentTab && currentTab.url.includes("://www.google.com/maps/search")) {
+        if (currentTab && (currentTab.url || "").includes("://www.google.com/maps/search")) {
             document.getElementById('message').textContent = "Let's scrape Google Maps!";
             actionButton.disabled = false;
             actionButton.classList.add('enabled');
@@ -43,12 +43,23 @@ document.addEventListener('DOMContentLoaded', function() {
             actionButton.style.display = 'none'; 
         }
 
+        var progress = null;
+
         // Restore the last results, so closing the popup doesn't lose them
-        chrome.storage.local.get('results', function(data) {
-            if (data && Array.isArray(data.results) && data.results.length) {
+        chrome.storage.local.get(['results', 'progress'], function(data) {
+            progress = data && data.progress;
+            if (data && Array.isArray(data.results)) {
                 allResults = data.results;
-                refresh();
             }
+            refresh();
+        });
+
+        // Live updates while the background search for emails/socials runs
+        chrome.storage.onChanged.addListener(function(changes, area) {
+            if (area !== 'local') return;
+            if (changes.results) allResults = changes.results.newValue || [];
+            if (changes.progress) progress = changes.progress.newValue;
+            refresh();
         });
 
         filterInputs.forEach(function(input) {
@@ -71,7 +82,8 @@ document.addEventListener('DOMContentLoaded', function() {
                     item.linkedin = '';
                     return item;
                 });
-                saveResults();
+                progress = null;
+                chrome.storage.local.set({ results: allResults, progress: null });
                 refresh();
             });
         });
@@ -83,7 +95,7 @@ document.addEventListener('DOMContentLoaded', function() {
                     setStatus('Website access is needed to find emails and social links.');
                     return;
                 }
-                findEmailsAndSocials();
+                chrome.runtime.sendMessage({ type: 'findContacts' });
             });
         });
 
@@ -100,60 +112,21 @@ document.addEventListener('DOMContentLoaded', function() {
 
         function refresh() {
             var shown = renderTable(resultsTable, filterResults(allResults));
+            var busy = !!(progress && progress.running);
             downloadCsvButton.disabled = shown === 0;
-            findEmailsButton.disabled = !allResults.some(function(item) { return item.companyUrl; });
-            if (allResults.length) {
-                setStatus('Showing ' + shown + ' of ' + allResults.length + ' businesses. Download exports only the rows shown.');
+            findEmailsButton.disabled = busy || !allResults.some(function(item) { return item.companyUrl && !item.contactsChecked; });
+            actionButton.disabled = busy || actionButton.style.display === 'none';
+            var text = allResults.length ? 'Showing ' + shown + ' of ' + allResults.length + ' businesses. Download exports only the rows shown.' : '';
+            if (progress && progress.text) {
+                text = progress.text + (busy ? ' You can close this popup; it keeps running.' : '') + ' ' + text;
             }
-        }
-
-        function findEmailsAndSocials() {
-            var todo = allResults.filter(function(item) { return item.companyUrl && !item.checked; });
-            var done = 0;
-            var next = 0;
-            findEmailsButton.disabled = true;
-            actionButton.disabled = true;
-            setStatus('Checking websites: 0 of ' + todo.length + '... keep this popup open.');
-
-            function worker() {
-                if (next >= todo.length) return Promise.resolve();
-                var item = todo[next++];
-                return getContactInfo(item.companyUrl).then(function(info) {
-                    item.email = info.emails.join('; ');
-                    item.instagram = info.instagram;
-                    item.facebook = info.facebook;
-                    item.linkedin = info.linkedin;
-                    item.checked = true;
-                }).catch(function() {
-                    item.checked = true;
-                }).then(function() {
-                    done++;
-                    saveResults();
-                    refresh();
-                    setStatus('Checking websites: ' + done + ' of ' + todo.length + '... keep this popup open.');
-                    return worker();
-                });
-            }
-
-            // Check 4 websites at a time
-            var workers = [];
-            for (var i = 0; i < 4; i++) workers.push(worker());
-            Promise.all(workers).then(function() {
-                actionButton.disabled = false;
-                refresh();
-                var found = allResults.filter(function(item) { return item.email; }).length;
-                setStatus('Done. Found emails for ' + found + ' of ' + allResults.length + ' businesses.');
-            });
+            setStatus(text);
         }
     });
 });
 
 function setStatus(text) {
     document.getElementById('status').textContent = text;
-}
-
-function saveResults() {
-    chrome.storage.local.set({ results: allResults });
 }
 
 function filterResults(results) {
@@ -214,106 +187,6 @@ function cleanWebsite(url) {
         return '';
     }
 }
-
-// Fetch a page with a time limit and parse it as HTML
-function fetchPage(url) {
-    var controller = new AbortController();
-    var timer = setTimeout(function() { controller.abort(); }, 10000);
-    return fetch(url, { signal: controller.signal, credentials: 'omit' }).then(function(response) {
-        clearTimeout(timer);
-        var type = response.headers.get('content-type') || '';
-        if (!response.ok || type.indexOf('html') === -1) throw new Error('Not an HTML page');
-        return response.text().then(function(html) {
-            return { url: response.url || url, doc: new DOMParser().parseFromString(html, 'text/html'), html: html };
-        });
-    }, function(error) {
-        clearTimeout(timer);
-        throw error;
-    });
-}
-
-// Visit the website's home page (and its contact/about page if needed) and
-// collect email addresses and Instagram, Facebook and LinkedIn links
-function getContactInfo(website) {
-    var info = { emails: [], instagram: '', facebook: '', linkedin: '' };
-    var visited = {};
-
-    function scan(page) {
-        visited[page.url.replace(/#.*$/, '')] = true;
-        extractEmails(page).forEach(function(email) {
-            if (info.emails.indexOf(email) === -1) info.emails.push(email);
-        });
-        Array.from(page.doc.querySelectorAll('a[href]')).forEach(function(a) {
-            var href = a.getAttribute('href') || '';
-            if (!info.instagram && /^https?:\/\/(www\.)?instagram\.com\/(?!p\/|reel\/|explore\/|share)[\w.]+/i.test(href)) info.instagram = href;
-            if (!info.facebook && /^https?:\/\/(www\.|m\.|web\.)?(facebook|fb)\.com\/(?!sharer|share|dialog|plugins|tr\b)[^\s]+/i.test(href)) info.facebook = href;
-            if (!info.linkedin && /^https?:\/\/([a-z]{2,3}\.)?linkedin\.com\/(company|in|school)\/[^\s]+/i.test(href)) info.linkedin = href;
-        });
-    }
-
-    return fetchPage(website).then(function(home) {
-        scan(home);
-        if (info.emails.length) return info;
-
-        // No email on the home page: try up to 2 contact/about pages on the same site
-        var host = new URL(home.url).hostname;
-        var candidates = [];
-        Array.from(home.doc.querySelectorAll('a[href]')).forEach(function(a) {
-            var text = (a.textContent + ' ' + a.getAttribute('href')).toLowerCase();
-            if (!/contact|about|reach|get-in-touch/.test(text)) return;
-            try {
-                var url = new URL(a.getAttribute('href'), home.url);
-                url.hash = '';
-                if (url.hostname === host && !visited[url.href] && candidates.indexOf(url.href) === -1) {
-                    candidates.push(url.href);
-                }
-            } catch (e) {}
-        });
-
-        return candidates.slice(0, 2).reduce(function(chain, url) {
-            return chain.then(function() {
-                if (info.emails.length) return;
-                return fetchPage(url).then(scan, function() {});
-            });
-        }, Promise.resolve()).then(function() { return info; });
-    });
-}
-
-function extractEmails(page) {
-    var found = [];
-
-    // mailto: links
-    Array.from(page.doc.querySelectorAll('a[href^="mailto:" i]')).forEach(function(a) {
-        found.push(decodeURIComponent(a.getAttribute('href').slice(7).split('?')[0]));
-    });
-
-    // Cloudflare-protected emails
-    Array.from(page.doc.querySelectorAll('[data-cfemail]')).forEach(function(el) {
-        var encoded = el.getAttribute('data-cfemail');
-        var key = parseInt(encoded.substr(0, 2), 16);
-        var email = '';
-        for (var i = 2; i < encoded.length; i += 2) {
-            email += String.fromCharCode(parseInt(encoded.substr(i, 2), 16) ^ key);
-        }
-        found.push(email);
-    });
-
-    // Emails written in the page text or HTML
-    var text = (page.doc.body ? page.doc.body.textContent : '') + ' ' + page.html;
-    found = found.concat(text.match(/[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/gi) || []);
-
-    var unique = [];
-    found.forEach(function(email) {
-        email = email.trim().toLowerCase().replace(/^[^a-z0-9]+|[^a-z]+$/g, '');
-        if (!/^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$/.test(email)) return;
-        if (/\.(png|jpe?g|gif|svg|webp|css|js)$/.test(email)) return;
-        if (/(example\.|sentry|wixpress|domain\.com|email\.com|yourdomain|@2x)/.test(email)) return;
-        if (unique.indexOf(email) === -1) unique.push(email);
-    });
-    return unique.slice(0, 3);
-}
-
-
 
 function scrapeData() {
     var links = Array.from(document.querySelectorAll('a[href^="https://www.google.com/maps/place"]'));
