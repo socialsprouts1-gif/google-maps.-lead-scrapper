@@ -111,30 +111,77 @@ function scrapeData() {
             }
         }
 
-        // Address and Industry
+        // Info lines of the result card, each split on the "·" separator, e.g.
+        //   ["Chartered accountant", "A-309 Privilon, Ambli Rd"]
+        //   ["Closed", "Opens 10 am", "090168 75077"]
+        var infoLines = [];
         if (container) {
-            var containerText = container.textContent || '';
-            var addressRegex = /\d+ [\w\s]+(?:#\s*\d+|Suite\s*\d+|Apt\s*\d+)?/;
-            var addressMatch = containerText.match(addressRegex);
+            Array.from(container.querySelectorAll('.W4Efsd')).forEach(function(line) {
+                if (line.querySelector('.W4Efsd') || line.querySelector('[role="img"]')) return;
+                var segments = (line.textContent || '').split(/[·⋅]/).map(function(s) {
+                    return s.replace(/\s+/g, ' ').trim();
+                }).filter(function(s) { return s; });
+                if (segments.length) infoLines.push(segments);
+            });
+        }
 
-            if (addressMatch) {
-                address = addressMatch[0];
+        // Phone Numbers (any country format and length, leading zeros kept)
+        if (container) {
+            var phoneEl = container.querySelector('.UsdlK');
+            if (phoneEl && isPhoneNumber(phoneEl.textContent.trim())) {
+                phone = phoneEl.textContent.trim();
+            }
+            if (!phone) {
+                infoLines.some(function(segments) {
+                    phone = segments.find(isPhoneNumber) || '';
+                    return phone;
+                });
+            }
+            if (!phone) {
+                var phoneMatches = (container.textContent || '').match(/\+?\(?\d[\d\s().-]{5,}\d/g) || [];
+                phone = phoneMatches.map(function(m) { return m.trim(); }).find(isPhoneNumber) || '';
+            }
+        }
 
-                // Extract industry text based on the position before the address
-                var textBeforeAddress = containerText.substring(0, containerText.indexOf(address)).trim();
-                var ratingIndex = textBeforeAddress.lastIndexOf(rating + reviewCount);
-                if (ratingIndex !== -1) {
-                    // Assuming industry is the first significant text after rating and review count
-                    var rawIndustryText = textBeforeAddress.substring(ratingIndex + (rating + reviewCount).length).trim().split(/[\r\n]+/)[0];
-                    industry = rawIndustryText.replace(/[·.,#!?]/g, '').trim();
+        // Industry and Address
+        if (container) {
+            var detailLine = infoLines.find(function(segments) {
+                return !segments.some(function(segment) {
+                    return isPhoneNumber(segment) || /^(Open|Closed|Opens|Closes|Temporarily closed|Permanently closed)\b/i.test(segment);
+                });
+            });
+            if (detailLine) {
+                industry = detailLine[0];
+                if (detailLine.length > 1) {
+                    address = detailLine[detailLine.length - 1];
                 }
-                var filterRegex = /\b(Closed|Open 24 hours|24 hours)|Open\b/g;
-                address = address.replace(filterRegex, '').trim();
-                address = address.replace(/(\d+)(Open)/g, '$1').trim();
-                address = address.replace(/(\w)(Open)/g, '$1').trim();
-                address = address.replace(/(\w)(Closed)/g, '$1').trim();
             } else {
-                address = '';
+                // Fallback: text-based parsing, with the phone number removed
+                // so it can't be mistaken for an address
+                var containerText = container.textContent || '';
+                if (phone) {
+                    containerText = containerText.split(phone).join(' ');
+                }
+                var addressRegex = /\d+ [\w\s]+(?:#\s*\d+|Suite\s*\d+|Apt\s*\d+)?/;
+                var addressMatch = containerText.match(addressRegex);
+
+                if (addressMatch) {
+                    address = addressMatch[0];
+
+                    // Extract industry text based on the position before the address
+                    var textBeforeAddress = containerText.substring(0, containerText.indexOf(address)).trim();
+                    var ratingIndex = textBeforeAddress.lastIndexOf(rating + reviewCount);
+                    if (ratingIndex !== -1) {
+                        // Assuming industry is the first significant text after rating and review count
+                        var rawIndustryText = textBeforeAddress.substring(ratingIndex + (rating + reviewCount).length).trim().split(/[\r\n]+/)[0];
+                        industry = rawIndustryText.replace(/[·.,#!?]/g, '').trim();
+                    }
+                    var filterRegex = /\b(Closed|Open 24 hours|24 hours)|Open\b/g;
+                    address = address.replace(filterRegex, '').trim();
+                    address = address.replace(/(\d+)(Open)/g, '$1').trim();
+                    address = address.replace(/(\w)(Open)/g, '$1').trim();
+                    address = address.replace(/(\w)(Closed)/g, '$1').trim();
+                }
             }
         }
 
@@ -145,14 +192,6 @@ function scrapeData() {
             if (filteredLinks.length > 0) {
                 companyUrl = filteredLinks[0].href;
             }
-        }
-
-        // Phone Numbers
-        if (container) {
-            var containerText = container.textContent || '';
-            var phoneRegex = /(\+\d{1,2}\s)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}/;
-            var phoneMatch = containerText.match(phoneRegex);
-            phone = phoneMatch ? phoneMatch[0] : '';
         }
 
         // Return the data as an object
@@ -167,6 +206,16 @@ function scrapeData() {
             href: link.href,
         };
     });
+
+    // A phone number: optional "+", then digits with spaces, dashes, dots or
+    // parentheses. 7-15 digits (the international maximum), so leading zeros
+    // and long numbers like "090168 75077" or "+91 98765 43210" stay whole.
+    function isPhoneNumber(text) {
+        if (!/^\+?[\d\s().-]+$/.test(text)) return false;
+        if (/^\d+\.\d+\s*\(/.test(text)) return false; // rating like "4.9(312)"
+        var digits = text.replace(/\D/g, '');
+        return digits.length >= 7 && digits.length <= 15;
+    }
 }
 
 // Convert the table to a CSV string
@@ -178,11 +227,16 @@ function tableToCsv(table) {
         var row = [], cols = rows[i].querySelectorAll('td, th');
         
         for (var j = 0; j < cols.length; j++) {
-            row.push('"' + cols[j].innerText + '"');
+            var value = (cols[j].textContent || '').trim();
+            // Write phone numbers as text so Excel/Sheets keep the leading zero
+            if (cols[j].tagName === 'TD' && j === 3 && value) {
+                value = '="' + value + '"';
+            }
+            row.push('"' + value.replace(/"/g, '""') + '"');
         }
         csv.push(row.join(','));
     }
-    return csv.join('\n');
+    return csv.join('\r\n');
 }
 
 // Download the CSV file
@@ -190,7 +244,8 @@ function downloadCsv(csv, filename) {
     var csvFile;
     var downloadLink;
 
-    csvFile = new Blob([csv], {type: 'text/csv'});
+    // UTF-8 BOM so Excel shows characters like "–" correctly
+    csvFile = new Blob(['﻿' + csv], {type: 'text/csv;charset=utf-8'});
     downloadLink = document.createElement('a');
     downloadLink.download = filename;
     downloadLink.href = window.URL.createObjectURL(csvFile);
